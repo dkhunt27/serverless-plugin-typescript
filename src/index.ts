@@ -1,19 +1,22 @@
 import * as path from 'path'
-import * as fs from 'fs-p'
+import * as fs from 'fs-extra'
+
 import * as _ from 'lodash'
 import * as globby from 'globby'
 
 import { ServerlessOptions, ServerlessInstance, ServerlessFunction } from './types'
 import * as typescript from './typescript'
 
+import { watchFiles } from './watchFiles'
+
 // Folders
 const serverlessFolder = '.serverless'
 const buildFolder = '.build'
 
-class ServerlessPlugin {
+export class TypeScriptPlugin {
 
   private originalServicePath: string
-  private originalFunctions: { [key: string]: ServerlessFunction } | {}
+  private isWatching: boolean
 
   serverless: ServerlessInstance
   options: ServerlessOptions
@@ -25,70 +28,122 @@ class ServerlessPlugin {
     this.options = options
 
     this.hooks = {
-      'before:offline:start:init': this.beforeCreateDeploymentArtifacts.bind(this),
-      'before:package:createDeploymentArtifacts': this.beforeCreateDeploymentArtifacts.bind(this, 'service'),
-      'after:package:createDeploymentArtifacts': this.afterCreateDeploymentArtifacts.bind(this, 'service'),
-      'before:deploy:function:packageFunction': this.beforeCreateDeploymentArtifacts.bind(this, 'function'),
-      'after:deploy:function:packageFunction': this.afterCreateDeploymentArtifacts.bind(this, 'function'),
-      'before:invoke:local:invoke': this.beforeCreateDeploymentArtifacts.bind(this),
-      'after:invoke:local:invoke': this.cleanup.bind(this),
-    }
-    this.commands = {
-      ts: {
-        commands: {
-          invoke: {
-            usage: 'Run a function locally from the tsc output bundle',
-            lifecycleEvents: [
-              'invoke',
-            ],
-            options: {
-              function: {
-                usage: 'Name of the function',
-                shortcut: 'f',
-                required: true,
-              },
-              path: {
-                usage: 'Path to JSON file holding input data',
-                shortcut: 'p',
-              },
-            },
-          },
-        },
+      'before:run:run': async () => {
+        await this.compileTs()
       },
+      'before:offline:start': async () => {
+        await this.compileTs()
+        this.watchAll()
+      },
+      'before:offline:start:init': async () => {
+        await this.compileTs()
+        this.watchAll()
+      },
+      'before:package:createDeploymentArtifacts': this.compileTs.bind(this),
+      'after:package:createDeploymentArtifacts': this.cleanup.bind(this),
+      'before:deploy:function:packageFunction': this.compileTs.bind(this),
+      'after:deploy:function:packageFunction': this.cleanup.bind(this),
+      'before:invoke:local:invoke': async () => {
+        const emitedFiles = await this.compileTs()
+        if (this.isWatching) {
+          emitedFiles.forEach(filename => {
+            const module = require.resolve(path.resolve(this.originalServicePath, filename))
+            delete require.cache[module]
+          })
+        }
+      },
+      'after:invoke:local:invoke': () => {
+        if (this.options.watch) {
+          this.watchFunction()
+          this.serverless.cli.log('Waiting for changes ...')
+        }
+      }
     }
   }
 
-  async beforeCreateDeploymentArtifacts(type: string): Promise<void> {
-    this.serverless.cli.log('Compiling with Typescript...')
-
-    // Save original service path and functions
-    this.originalServicePath = this.serverless.config.servicePath
-    this.originalFunctions = type === 'function'
-      ? _.pick(this.serverless.service.functions, [this.options.function])
+  get functions() {
+    return this.options.function
+      ? { [this.options.function] : this.serverless.service.functions[this.options.function] }
       : this.serverless.service.functions
+  }
 
-    // Fake service path so that serverless will know what to zip
-    this.serverless.config.servicePath = path.join(this.originalServicePath, buildFolder)
+  get rootFileNames() {
+    return typescript.extractFileNames(this.originalServicePath, this.serverless.service.provider.name, this.functions)
+  }
 
-    const tsFileNames = typescript.extractFileNames(this.originalFunctions)
-    const tsconfig = typescript.getTypescriptConfig(this.originalServicePath)
-
-    for (const fnName in this.originalFunctions) {
-      const fn = this.originalFunctions[fnName]
+  prepare() {
+    // exclude serverless-plugin-typescript
+    const functions = this.functions
+    for (const fnName in functions) {
+      const fn = functions[fnName]
       fn.package = fn.package || {
         exclude: [],
         include: [],
       }
-      fn.package.exclude = _.uniq([...fn.package.exclude, 'node_modules/serverless-plugin-typescript'])
+      // Add plugin to excluded packages or an empty array if exclude is undefined
+      fn.package.exclude = _.uniq([...fn.package.exclude || [], 'node_modules/serverless-plugin-typescript'])
     }
+  }
+
+  async watchFunction(): Promise<void> {
+    if (this.isWatching) {
+      return
+    }
+
+    this.serverless.cli.log(`Watch function ${this.options.function}...`)
+
+    this.isWatching = true
+    watchFiles(this.rootFileNames, this.originalServicePath, () => {
+      this.serverless.pluginManager.spawn('invoke:local')
+    })
+  }
+
+  async watchAll(): Promise<void> {
+    if (this.isWatching) {
+      return
+    }
+
+    this.serverless.cli.log(`Watching typescript files...`)
+
+    this.isWatching = true
+    watchFiles(this.rootFileNames, this.originalServicePath, () => {
+      this.compileTs()
+    })
+  }
+
+  async compileTs(): Promise<string[]> {
+    this.prepare()
+    this.serverless.cli.log('Compiling with Typescript...')
+
+    if (!this.originalServicePath) {
+      // Save original service path and functions
+      this.originalServicePath = this.serverless.config.servicePath
+      // Fake service path so that serverless will know what to zip
+      this.serverless.config.servicePath = path.join(this.originalServicePath, buildFolder)
+    }
+
+    const tsconfig = typescript.getTypescriptConfig(
+      this.originalServicePath,
+      this.isWatching ? null : this.serverless.cli
+    )
 
     tsconfig.outDir = buildFolder
 
-    await typescript.run(tsFileNames, tsconfig)
+    const emitedFiles = await typescript.run(this.rootFileNames, tsconfig)
+    await this.copyExtras()
+    this.serverless.cli.log('Typescript compiled.')
+    return emitedFiles
+  }
 
+  async copyExtras() {
     // include node_modules into build
     if (!fs.existsSync(path.resolve(path.join(buildFolder, 'node_modules')))) {
       fs.symlinkSync(path.resolve('node_modules'), path.resolve(path.join(buildFolder, 'node_modules')))
+    }
+
+    // include package.json into build so Serverless can exlcude devDeps during packaging
+    if (!fs.existsSync(path.resolve(path.join(buildFolder, 'package.json')))) {
+      fs.symlinkSync(path.resolve('package.json'), path.resolve(path.join(buildFolder, 'package.json')))
     }
 
     // include any "extras" from the "include" section
@@ -110,23 +165,44 @@ class ServerlessPlugin {
     }
   }
 
-  async afterCreateDeploymentArtifacts(type: string): Promise<void> {
-    // Copy .build to .serverless
+  async moveArtifacts(): Promise<void> {
     await fs.copy(
       path.join(this.originalServicePath, buildFolder, serverlessFolder),
       path.join(this.originalServicePath, serverlessFolder)
     )
 
-    const basename = type === 'function'
-      ? path.basename(this.originalFunctions[this.options.function].artifact)
-      : path.basename(this.serverless.service.package.artifact)
-    this.serverless.service.package.artifact = path.join(this.originalServicePath, serverlessFolder, basename)
+    if (this.options.function) {
+      const fn = this.serverless.service.functions[this.options.function]
+      const basename = path.basename(fn.package.artifact)
+      fn.package.artifact =  path.join(
+        this.originalServicePath,
+        serverlessFolder,
+        path.basename(fn.package.artifact)
+      )
+      return
+    }
 
-    // Cleanup after everything is copied
-    await this.cleanup()
+    if (this.serverless.service.package.individually) {
+      const functionNames = this.serverless.service.getAllFunctions()
+      functionNames.forEach(name => {
+        this.serverless.service.functions[name].package.artifact = path.join(
+          this.originalServicePath,
+          serverlessFolder,
+          path.basename(this.serverless.service.functions[name].package.artifact)
+        )
+      })
+      return
+    }
+
+    this.serverless.service.package.artifact = path.join(
+      this.originalServicePath,
+      serverlessFolder,
+      path.basename(this.serverless.service.package.artifact)
+    )
   }
 
   async cleanup(): Promise<void> {
+    await this.moveArtifacts()
     // Restore service path
     this.serverless.config.servicePath = this.originalServicePath
     // Remove temp build folder
@@ -135,4 +211,4 @@ class ServerlessPlugin {
 
 }
 
-module.exports = ServerlessPlugin
+module.exports = TypeScriptPlugin

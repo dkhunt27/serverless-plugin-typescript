@@ -1,6 +1,6 @@
 {
   "name": "serverless-plugin-typescript",
-  "version": "0.4.0",
+  "version": "0.0.0-semantic-release",
   "main": "dist/src/index.js",
   "files": [
     "dist",
@@ -26,17 +26,17 @@
     "aws lambda"
   ],
   "devDependencies": {
-    "@types/fs-extra": "2.0.0",
-    "@types/jest": "^19.2.4",
-    "@types/lodash": "^4.14.62",
-    "jest": "^20.0.4",
-    "mock-fs": "^4.3.0",
-    "ts-jest": "^20.0.6",
-    "tslint": "^5.1.0"
+    "@types/fs-extra": "5.0.0",
+    "@types/jest": "22.0.1",
+    "@types/lodash": "4.14.91",
+    "jest": "22.0.4",
+    "mock-fs": "4.4.2",
+    "ts-jest": "22.0.1",
+    "tslint": "5.8.0"
   },
   "dependencies": {
-    "fs-p": "2.0.0",
-    "globby": "^6.1.0",
+    "fs-extra": "^5.0.0",
+    "globby": "^7.0.0",
     "lodash": "^4.17.4",
     "typescript": "^2.2.2"
   },
